@@ -33,7 +33,7 @@
 #include <stddef.h>
 
 #define FL_DRIVER_NAME "Frostlake ODBC Driver"
-#define FL_DRIVER_VER "01.00.0000"
+#define FL_DRIVER_VER "01.01.0000"
 #define FL_ODBC_VER "03.51"
 #define FL_DBMS_NAME "Frostlake"
 
