@@ -99,6 +99,20 @@ static const char *skip_non_placeholder(const char *c) {
     return NULL;
 }
 
+/* Whether the application has bound any parameter on this statement. Substitution waits for
+ * one: with nothing bound, every `?` is the engine's to read — a Snowflake Scripting cursor bind
+ * such as `DECLARE c CURSOR FOR ... WHERE x > ?` opened `USING (...)` is exactly that — and the
+ * text goes through untouched, as a statement with no parameters does in the account's drivers.
+ * Once something is bound, a marker without a binding is still refused with 07002. */
+static int has_bound_params(const fl_stmt *stmt) {
+    for (int i = 0; i < stmt->param_capacity; i++) {
+        if (stmt->params[i].bound) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Count the `?` markers that are actually placeholders. */
 static int count_placeholders(const char *sql) {
     int count = 0;
@@ -435,7 +449,8 @@ static void track_context(fl_dbc *dbc, const char *sql) {
 static SQLRETURN run_sql(fl_stmt *stmt, const char *sql) {
     fl_stmt_clear_results(stmt);
     char *transport_error = NULL;
-    fl_response *response = fl_proto_execute(stmt->dbc, sql, &transport_error);
+    fl_response *response = fl_proto_execute_counted(stmt->dbc, sql, stmt->multi_statement_count,
+                                                    &transport_error);
     if (response == NULL) {
         SQLRETURN rc = fl_diag_setf(stmt, "08S01", "%s", transport_error);
         free(transport_error);
@@ -475,7 +490,7 @@ SQLRETURN SQL_API SQLExecDirect(SQLHSTMT StatementHandle, SQLCHAR *StatementText
         return fl_diag_set(stmt, "HY001", "Out of memory");
     }
     char *final_sql = sql;
-    if (count_placeholders(sql) > 0) {
+    if (has_bound_params(stmt) && count_placeholders(sql) > 0) {
         final_sql = substitute_params(stmt, sql);
         if (final_sql == NULL) {
             free(sql);
@@ -517,7 +532,7 @@ SQLRETURN SQL_API SQLExecute(SQLHSTMT StatementHandle) {
     }
     char *final_sql = stmt->prepared_sql;
     int substituted = 0;
-    if (count_placeholders(stmt->prepared_sql) > 0) {
+    if (has_bound_params(stmt) && count_placeholders(stmt->prepared_sql) > 0) {
         final_sql = substitute_params(stmt, stmt->prepared_sql);
         if (final_sql == NULL) {
             return SQL_ERROR; /* diag already set */
@@ -655,6 +670,15 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
             /* honoured for real in SQLFetch */
             stmt->max_rows = (SQLULEN) value;
             return SQL_SUCCESS;
+        case SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT:
+            /* How many statements the next execute carries: -1 leaves it to the session, 0 allows
+             * any number. It rides on the request and changes nothing about the session. */
+            if ((SQLLEN) (intptr_t) ValuePtr < -1) {
+                return fl_diag_set(stmt, "HY024",
+                    "SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT must be -1, 0, or a statement count");
+            }
+            stmt->multi_statement_count = (SQLLEN) (intptr_t) ValuePtr;
+            return SQL_SUCCESS;
         case SQL_ATTR_ROWS_FETCHED_PTR:
             stmt->rows_fetched_ptr = (SQLULEN *) ValuePtr;
             return SQL_SUCCESS;
@@ -743,6 +767,9 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
         return SQL_SUCCESS;
     }
     switch (Attribute) {
+        case SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT:
+            *(SQLLEN *) ValuePtr = stmt->multi_statement_count;
+            return SQL_SUCCESS;
         case SQL_ATTR_CURSOR_TYPE:
             *(SQLULEN *) ValuePtr = SQL_CURSOR_FORWARD_ONLY;
             return SQL_SUCCESS;

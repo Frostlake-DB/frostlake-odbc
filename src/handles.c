@@ -165,6 +165,7 @@ static SQLRETURN alloc_stmt(fl_dbc *dbc, SQLHANDLE *out) {
     stmt->current_row = -1;
     stmt->row_count = -1;
     stmt->getdata_col = -1;
+    stmt->multi_statement_count = -1;
     *out = stmt;
     return SQL_SUCCESS;
 }

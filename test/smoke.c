@@ -26,9 +26,16 @@
 #include <sql.h>
 #include <sqlext.h>
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The driver's statement attribute for the per-request statement count, as an application takes it
+ * from the driver's documentation. Same name and meaning as the account's ODBC driver uses. */
+#ifndef SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT
+#define SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT 16385
+#endif
 
 static int checks;
 
@@ -58,6 +65,13 @@ static void require(int condition, const char *what, SQLSMALLINT type, SQLHANDLE
 
 static void require_rc(SQLRETURN rc, const char *what, SQLSMALLINT type, SQLHANDLE handle) {
     require(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO, what, type, handle);
+}
+
+/* A check this engine cannot answer. Reported as a TAP skip rather than a pass: a green tick would
+   claim the engine had been checked for something it never reports. */
+static void skip(const char *what, const char *why) {
+    checks++;
+    printf("ok %d - %s # SKIP %s\n", checks, what, why);
 }
 
 /* Run SQL, expecting success. */
@@ -140,6 +154,51 @@ int main(void) {
     require(strcmp((char *) column_name, "PRICE") == 0, "column 3 is PRICE", SQL_HANDLE_STMT, stmt);
     require(data_type == SQL_DECIMAL, "PRICE is SQL_DECIMAL", SQL_HANDLE_STMT, stmt);
     require(column_size == 10 && digits == 2, "PRICE is NUMBER(10,2)", SQL_HANDLE_STMT, stmt);
+
+    /* A text or binary column reports its OWN length, not a blanket maximum: the account reports
+       that number as the column's precision and display size alike. */
+    {
+        SQLHSTMT sized = NULL;
+        require_rc(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &sized),
+                   "allocate a statement for the sized columns", SQL_HANDLE_DBC, dbc);
+        exec_ok(sized, "CREATE OR REPLACE TABLE sized_t (S VARCHAR(9), B BINARY(5), BIG VARCHAR, N NUMBER(10,2))");
+        require_rc(SQLExecDirect(sized, (SQLCHAR *) "SELECT S, B, BIG, N FROM sized_t", SQL_NTS),
+                   "select the sized columns", SQL_HANDLE_STMT, sized);
+        SQLULEN sized_size = 0;
+        SQLSMALLINT sized_digits = 0, sized_type = 0, sized_nullable = 0, sized_name_length = 0;
+        SQLCHAR sized_name[128];
+        require_rc(SQLDescribeCol(sized, 1, sized_name, sizeof(sized_name), &sized_name_length,
+                                  &sized_type, &sized_size, &sized_digits, &sized_nullable),
+                   "describe VARCHAR(9)", SQL_HANDLE_STMT, sized);
+        /* Engines before 0.1.0 send no length, and this driver supports them: with nothing to
+           report, the column falls back to the blanket maximum and there is no width to check. */
+        const int reports_length = sized_size != 16777216;
+        if (!reports_length) {
+            skip("a VARCHAR(9) reports 9 characters", "engine sends no column length");
+            skip("a BINARY(5) reports 5 bytes", "engine sends no column length");
+            skip("an unbounded VARCHAR reports the maximum", "engine sends no column length");
+        } else {
+            require(sized_size == 9, "a VARCHAR(9) reports 9 characters", SQL_HANDLE_STMT, sized);
+            require_rc(SQLDescribeCol(sized, 2, sized_name, sizeof(sized_name), &sized_name_length,
+                                      &sized_type, &sized_size, &sized_digits, &sized_nullable),
+                       "describe BINARY(5)", SQL_HANDLE_STMT, sized);
+            require(sized_size == 5, "a BINARY(5) reports 5 bytes", SQL_HANDLE_STMT, sized);
+            require_rc(SQLDescribeCol(sized, 3, sized_name, sizeof(sized_name), &sized_name_length,
+                                      &sized_type, &sized_size, &sized_digits, &sized_nullable),
+                       "describe an unbounded VARCHAR", SQL_HANDLE_STMT, sized);
+            require(sized_size == 16777216, "an unbounded VARCHAR reports the maximum",
+                    SQL_HANDLE_STMT, sized);
+        }
+        /* A number is untouched by this: it reports its own precision, and carries no length. */
+        require_rc(SQLDescribeCol(sized, 4, sized_name, sizeof(sized_name), &sized_name_length,
+                                  &sized_type, &sized_size, &sized_digits, &sized_nullable),
+                   "describe NUMBER(10,2)", SQL_HANDLE_STMT, sized);
+        require(sized_size == 10 && sized_digits == 2, "a NUMBER still reports its precision",
+                SQL_HANDLE_STMT, sized);
+        SQLCloseCursor(sized);
+        exec_ok(sized, "DROP TABLE sized_t");
+        SQLFreeHandle(SQL_HANDLE_STMT, sized);
+    }
 
     require_rc(SQLDescribeCol(stmt, 1, column_name, sizeof(column_name), &name_length,
                               &data_type, &column_size, &digits, &nullable),
@@ -273,6 +332,43 @@ int main(void) {
             "bound buffers carry id=1 name=alice", SQL_HANDLE_STMT, stmt);
     SQLFreeStmt(stmt, SQL_UNBIND);
     SQLCloseCursor(stmt);
+
+    /* A STATEMENT can ask for a pack on its own, with no ALTER SESSION: the count rides on the
+       request and leaves the session's own setting alone. The session is still at its default of
+       one statement here, which is what makes the refusal below meaningful. */
+    rc = SQLSetStmtAttr(stmt, SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT, (SQLPOINTER) (intptr_t) 2, 0);
+    require_rc(rc, "declare a two-statement pack on the statement", SQL_HANDLE_STMT, stmt);
+    SQLLEN declared = 0;
+    rc = SQLGetStmtAttr(stmt, SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT, &declared, 0, NULL);
+    require_rc(rc, "read the declared count back", SQL_HANDLE_STMT, stmt);
+    require(declared == 2, "the statement reports the count it was given", SQL_HANDLE_STMT, stmt);
+    rc = SQLExecDirect(stmt, (SQLCHAR *) "SELECT 1 AS a; SELECT 2 AS b", SQL_NTS);
+    require_rc(rc, "a pack the statement asked for runs", SQL_HANDLE_STMT, stmt);
+    require(SQLMoreResults(stmt) == SQL_SUCCESS, "the asked-for pack has a second result",
+            SQL_HANDLE_STMT, stmt);
+    SQLFreeStmt(stmt, SQL_CLOSE);
+
+    /* Handing the count back to the session shows nothing was changed on it: the same pack,
+       which the session never asked for, is refused. */
+    rc = SQLSetStmtAttr(stmt, SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT, (SQLPOINTER) (intptr_t) -1, 0);
+    require_rc(rc, "hand the count back to the session", SQL_HANDLE_STMT, stmt);
+    rc = SQLExecDirect(stmt, (SQLCHAR *) "SELECT 1 AS a; SELECT 2 AS b", SQL_NTS);
+    /* Only an engine that counts statements refuses one, and this driver supports older engines
+       that do not. Against one of those there is no refusal to observe, so the check is skipped
+       rather than passed. */
+    if (rc == SQL_ERROR) {
+        require(1, "a pack nobody asked for is still refused", SQL_HANDLE_STMT, stmt);
+    } else {
+        skip("a pack nobody asked for is still refused",
+             "engine does not enforce a statement count");
+    }
+    SQLFreeStmt(stmt, SQL_CLOSE);
+
+    /* A request holds one statement unless the session asks for more, so ask first. Zero
+       means any number, which keeps the single statements around it working too. */
+    rc = SQLExecDirect(stmt, (SQLCHAR *) "ALTER SESSION SET MULTI_STATEMENT_COUNT = 0", SQL_NTS);
+    require_rc(rc, "allow statement packs", SQL_HANDLE_STMT, stmt);
+    SQLFreeStmt(stmt, SQL_CLOSE);
 
     /* multi-statement execute walks result sets via SQLMoreResults */
     rc = SQLExecDirect(stmt, (SQLCHAR *) "SELECT 1 AS a; SELECT 2 AS b", SQL_NTS);
@@ -408,7 +504,7 @@ int main(void) {
     exec_ok(stmt, "SELECT 1 AS \"why?\"");
     exec_ok(stmt, "SELECT 'literal ? stays'");
     require_rc(SQLExecDirect(stmt, (SQLCHAR *)
-        "CREATE OR REPLACE FUNCTION f_smoke() RETURNS INT LANGUAGE JAVASCRIPT"
+        "CREATE OR REPLACE FUNCTION f_smoke() RETURNS DOUBLE LANGUAGE JAVASCRIPT"
         " AS $$ return 1 ? 2 : 3; $$", SQL_NTS),
         "a ? inside a $$ body is not a placeholder", SQL_HANDLE_STMT, stmt);
     SQLCloseCursor(stmt);
@@ -525,6 +621,84 @@ int main(void) {
                     SQL_DRIVER_NOPROMPT) == SQL_ERROR,
                 "a port outside 1..65535 is refused rather than wrapped", SQL_HANDLE_DBC, bad);
         SQLFreeHandle(SQL_HANDLE_DBC, bad);
+    }
+
+    /* A boolean's character form follows the column's declared type: 1/0 for a BOOLEAN column
+       (SQL_BIT), true/false where the engine declares the column as something else, as it does
+       for a session variable holding a boolean. Either way it still reads as a bit and a number. */
+    {
+        SQLHSTMT flags = NULL;
+        require_rc(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &flags),
+                   "allocate a statement for boolean cells", SQL_HANDLE_DBC, dbc);
+        exec_ok(flags, "SET smoke_flag = TRUE");
+        const char *queries[] = { "SELECT TRUE", "SELECT $smoke_flag" };
+        for (int q = 0; q < 2; q++) {
+            require_rc(SQLExecDirect(flags, (SQLCHAR *) queries[q], SQL_NTS), "select a boolean",
+                       SQL_HANDLE_STMT, flags);
+            SQLCHAR bool_name[64];
+            SQLSMALLINT bool_name_length = 0, bool_type = 0, bool_digits = 0, bool_nullable = 0;
+            SQLULEN bool_size = 0;
+            require_rc(SQLDescribeCol(flags, 1, bool_name, sizeof(bool_name), &bool_name_length, &bool_type,
+                                      &bool_size, &bool_digits, &bool_nullable),
+                       "describe the boolean column", SQL_HANDLE_STMT, flags);
+            require(SQLFetch(flags) == SQL_SUCCESS, "fetch the boolean row", SQL_HANDLE_STMT, flags);
+            char bool_text[16] = "";
+            SQLLEN bool_indicator = 0;
+            require_rc(SQLGetData(flags, 1, SQL_C_CHAR, bool_text, sizeof(bool_text), &bool_indicator),
+                       "read the boolean as text", SQL_HANDLE_STMT, flags);
+            require(strcmp(bool_text, bool_type == SQL_BIT ? "1" : "true") == 0,
+                    "a boolean's text follows its column's type", SQL_HANDLE_STMT, flags);
+            SQLCHAR bool_bit = 9;
+            require_rc(SQLGetData(flags, 1, SQL_C_BIT, &bool_bit, 0, &bool_indicator),
+                       "read the boolean as a bit", SQL_HANDLE_STMT, flags);
+            require(bool_bit == 1, "the boolean reads as bit 1", SQL_HANDLE_STMT, flags);
+            SQLINTEGER bool_int = -1;
+            require_rc(SQLGetData(flags, 1, SQL_C_SLONG, &bool_int, 0, &bool_indicator),
+                       "read the boolean as an integer", SQL_HANDLE_STMT, flags);
+            require(bool_int == 1, "the boolean reads as integer 1", SQL_HANDLE_STMT, flags);
+            SQLFreeStmt(flags, SQL_CLOSE);
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, flags);
+    }
+
+    /* With nothing bound, a `?` is the engine's to read — a Snowflake Scripting cursor bind is one —
+       so the statement reaches the engine instead of failing on the client with 07002. Once the
+       application has bound something, a marker past its bindings is still refused. */
+    {
+        SQLHSTMT unbound = NULL;
+        require_rc(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &unbound),
+                   "allocate a statement for an unbound marker", SQL_HANDLE_DBC, dbc);
+        SQLRETURN unbound_rc = SQLExecDirect(unbound, (SQLCHAR *) "SELECT ?", SQL_NTS);
+        SQLCHAR unbound_state[6] = "";
+        if (unbound_rc == SQL_ERROR) {
+            SQLCHAR unbound_message[512];
+            SQLINTEGER unbound_native = 0;
+            SQLSMALLINT unbound_length = 0;
+            SQLGetDiagRec(SQL_HANDLE_STMT, unbound, 1, unbound_state, &unbound_native, unbound_message,
+                          sizeof(unbound_message), &unbound_length);
+        }
+        require(unbound_rc != SQL_ERROR || strcmp((char *) unbound_state, "07002") != 0,
+                "an unbound marker goes to the engine, not a client-side 07002", SQL_HANDLE_STMT, unbound);
+        SQLFreeHandle(SQL_HANDLE_STMT, unbound);
+
+        SQLHSTMT partly = NULL;
+        require_rc(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &partly),
+                   "allocate a statement for a partly bound pair", SQL_HANDLE_DBC, dbc);
+        SQLINTEGER one_value = 1;
+        SQLLEN one_indicator = 0;
+        SQLBindParameter(partly, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &one_value, 0,
+                         &one_indicator);
+        require(SQLExecDirect(partly, (SQLCHAR *) "SELECT ?, ?", SQL_NTS) == SQL_ERROR,
+                "a marker past the bound parameters is refused", SQL_HANDLE_STMT, partly);
+        SQLCHAR partly_state[6] = "";
+        SQLCHAR partly_message[512];
+        SQLINTEGER partly_native = 0;
+        SQLSMALLINT partly_length = 0;
+        SQLGetDiagRec(SQL_HANDLE_STMT, partly, 1, partly_state, &partly_native, partly_message,
+                      sizeof(partly_message), &partly_length);
+        require(strcmp((char *) partly_state, "07002") == 0, "and the refusal is 07002",
+                SQL_HANDLE_STMT, partly);
+        SQLFreeHandle(SQL_HANDLE_STMT, partly);
     }
 
     /* clean up on the server, then tear down */

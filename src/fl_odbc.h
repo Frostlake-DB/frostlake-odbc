@@ -71,6 +71,10 @@ typedef struct fl_column {
     SQLSMALLINT sql_type; /* mapped ODBC SQL_* type */
     SQLINTEGER precision; /* numeric precision from the wire, 0 otherwise */
     SQLINTEGER scale;     /* numeric scale from the wire */
+    /* A text column's length in characters, or a binary column's in bytes, as the wire reported it;
+     * 0 when the server sent none — another type, or an engine predating the field. The account
+     * reports this same number as the column's precision AND its display size. */
+    SQLINTEGER length;
 } fl_column;
 
 typedef struct fl_resultset {
@@ -140,6 +144,12 @@ typedef struct fl_bound_param {
     int bound;
 } fl_bound_param;
 
+/* The statement attribute that says how many statements one execute carries. The account's ODBC
+ * driver spells it SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT with these same semantics — -1 for "use
+ * the session's setting", 0 for any number — but does not publish its numeric value, so this is the
+ * driver's own, in the range ODBC leaves to drivers. */
+#define SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT 16385
+
 typedef struct fl_stmt {
     fl_handle_header hdr;
     fl_dbc *dbc;
@@ -162,6 +172,10 @@ typedef struct fl_stmt {
     int param_capacity;
 
     /* statement attributes this driver actually acts on */
+    /* How many statements the next execute on this statement carries. -1 means the session's
+     * MULTI_STATEMENT_COUNT answers for it, which is what the account's driver means by -1 too;
+     * 0 means any number. */
+    SQLLEN multi_statement_count;
     SQLULEN max_rows;               /* 0 = every row */
     SQLULEN *rows_fetched_ptr;      /* written by SQLFetch when set */
     SQLUSMALLINT *row_status_ptr;   /* written by SQLFetch when set */
@@ -183,6 +197,11 @@ SQLRETURN fl_diag_warn(SQLHANDLE handle, const char *sqlstate, const char *messa
  * response — which may still carry error_message (SQL failure). Updates the
  * connection's session id from the response. */
 fl_response *fl_proto_execute(fl_dbc *dbc, const char *sql, char **transport_error);
+
+/* As fl_proto_execute, declaring how many statements the request carries: -1 leaves the session's
+ * MULTI_STATEMENT_COUNT to answer for it, 0 allows any number. */
+fl_response *fl_proto_execute_counted(fl_dbc *dbc, const char *sql, SQLLEN multi_statement_count,
+                                      char **transport_error);
 
 /* ---- shared helpers ------------------------------------------------------- */
 

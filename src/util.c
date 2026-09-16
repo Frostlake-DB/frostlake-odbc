@@ -175,8 +175,16 @@ const char *fl_type_display_size(const fl_column *col, SQLULEN *column_size, SQL
              * precision no row ever arrives with. */
             digits = 3;
             break;
-        case SQL_VARBINARY: size = 8388608; break;
-        default: size = 16777216; break; /* Snowflake-shaped VARCHAR maximum */
+        case SQL_VARBINARY:
+            /* The wire carries a binary column's own length in bytes; the constant is only the
+             * fallback for an engine that predates the field. */
+            size = col->length > 0 ? (SQLULEN) col->length : 8388608;
+            break;
+        default:
+            /* Likewise for text, in characters. An unbounded VARCHAR reports the maximum, which is
+             * what the account reports for one too, so the fallback and the real value agree there. */
+            size = col->length > 0 ? (SQLULEN) col->length : 16777216;
+            break;
     }
     if (column_size != NULL) {
         *column_size = size;

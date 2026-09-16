@@ -380,6 +380,15 @@ static SQLRETURN convert_cell(fl_stmt *stmt, const fl_column *column, const fl_c
     if (c_type == SQL_C_DEFAULT) {
         c_type = default_c_type(column);
     }
+    /* A boolean in a column not declared BOOLEAN keeps its true/false spelling for a character
+     * read, and converts to a bit or a number exactly as a BOOLEAN column's 1/0 does. */
+    if (cell->kind == 'b' && c_type != SQL_C_CHAR && c_type != SQL_C_BINARY) {
+        if (strcmp(text, "true") == 0) {
+            text = "1";
+        } else if (strcmp(text, "false") == 0) {
+            text = "0";
+        }
+    }
 
     switch (c_type) {
         case SQL_C_CHAR: {

@@ -8,8 +8,8 @@ and error messages.
 
 ```
 ┌─────────────┐   ODBC API    ┌──────────────────────┐   HTTP/JSON    ┌────────────────────┐
-│ application │ ───────────▶ │ libfrostlakeodbc.so   │ ─────────────▶ │ DatabaseHttpServer │
-│ (isql, ...) │   (unixODBC)  │ (this project)        │  /api/execute  │ (frostlake-db jar) │
+│ application │ ────────────▶ │ libfrostlakeodbc.so  │ ─────────────▶ │ DatabaseHttpServer │
+│ (isql, ...) │   (unixODBC)  │ (this project)       │  /api/execute  │ (frostlake-db jar) │
 └─────────────┘               └──────────────────────┘                └────────────────────┘
 ```
 
@@ -34,7 +34,7 @@ Requires gcc/make and unixODBC (`sql.h` + `libodbcinst`; Debian/Ubuntu:
 ```bash
 make            # build/libfrostlakeodbc.so
 make test       # spins up a throwaway Frostlake server (jar from ~/.m2) and
-                # runs 99 assertions through the real driver manager
+                # runs 199 assertions through the real driver manager
 make install    # register driver + "Frostlake" DSN for the current user
                 #   (~/.odbcinst.ini, ~/.odbc.ini — no root, reversible with
                 #    install/register.sh --remove)
@@ -60,17 +60,41 @@ Driver=Frostlake ODBC Driver;Server=localhost;Port=18082;Database=demo;Schema=pu
 ## What is supported
 
 - **Execution**: `SQLExecDirect`, `SQLPrepare`/`SQLExecute`, multi-statement
-  batches with `SQLMoreResults`, DML update counts derived from the
-  Snowflake-style "number of rows inserted/updated/deleted" result (summed —
-  same rule as the JDBC driver).
+  batches with `SQLMoreResults` — once the pack has been asked for. A request
+  holds one statement until it is, and an unasked-for pack is refused with
+  "Actual statement count N did not match the desired statement count D."
+  A statement can ask for itself, the way the account's own ODBC driver takes
+  it:
+
+  ```c
+  #define SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT 16385   /* this driver's value */
+  SQLSetStmtAttr(stmt, SQL_SF_STMT_ATTR_MULTI_STATEMENT_COUNT, (SQLPOINTER) 2, 0);
+  SQLExecDirect(stmt, (SQLCHAR *) "SELECT 1; SELECT 2", SQL_NTS);
+  ```
+
+  `0` allows any number and `-1` — the default — hands the decision back to the
+  session, exactly as the account's driver means those values. `SQLGetStmtAttr`
+  reads it back. The count travels on the request and changes nothing about the
+  session, so other statement handles on the connection are unaffected. The
+  attribute's NAME and semantics are the account's; the numeric value above is
+  this driver's own, because the account does not publish one.
+  `ALTER SESSION SET MULTI_STATEMENT_COUNT = n` still works for a whole session.
+  DML update counts are derived from the Snowflake-style
+  "number of rows inserted/updated/deleted" result (summed — same rule as the
+  JDBC driver).
 - **Parameters**: input `?` markers, substituted client-side exactly like the
   JDBC transport (strings escape both quote AND backslash; temporals emit
   ISO text with an explicit `::DATE`/`::TIME`/`::TIMESTAMP_NTZ` cast; binary
-  binds as `X'..'` hex).
+  binds as `X'..'` hex). Substitution starts once a parameter is bound: with
+  nothing bound the text is sent as written, so a Snowflake Scripting cursor's
+  own `?` (`DECLARE c CURSOR FOR … WHERE x > ?` … `OPEN c USING (…)`) reaches
+  the engine.
 - **Results**: `SQLBindCol` + `SQLFetch`, `SQLGetData` with chunked retrieval
   (01004 truncation semantics), conversions to char/all integer widths/
   double/float/bit/date/time/timestamp structs/raw binary (BINARY cells cross
   the wire as hex and are decoded). NUMBER text is exact at any precision.
+  A BOOLEAN column is `SQL_BIT`, so its text is `1`/`0`; a boolean in a column
+  the engine declares otherwise reads as `true`/`false`.
 - **Metadata**: `SQLDescribeCol`/`SQLColAttribute` with the engine's declared
   types (NUMBER(p,s) → `SQL_DECIMAL`; every integer alias → `SQL_BIGINT`,
   since Snowflake's INT/SMALLINT/… are all NUMBER(38,0)); `SQLTables` /
@@ -108,7 +132,7 @@ Driver=Frostlake ODBC Driver;Server=localhost;Port=18082;Database=demo;Schema=pu
 | `src/execute.c` | ExecDirect/Prepare/Execute/params/RowCount/MoreResults |
 | `src/results.c` | DescribeCol/ColAttribute/BindCol/Fetch/GetData conversions |
 | `src/catalog.c` | SQLTables/SQLColumns/SQLGetTypeInfo + empty index answers |
-| `test/smoke.c` | 99 assertions through the driver manager |
+| `test/smoke.c` | 199 assertions through the driver manager |
 | `test/smoke.sh` | private registration + throwaway server + smoke run |
 | `install/register.sh` | per-user driver/DSN registration (add/remove) |
 
