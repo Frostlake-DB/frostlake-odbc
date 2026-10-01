@@ -125,6 +125,24 @@ typedef struct fl_dbc {
     int autocommit;     /* SQL_ATTR_AUTOCOMMIT, mirrored to ALTER SESSION */
     int login_timeout;    /* seconds for the connect probe, 0 = none */
     int request_timeout;  /* seconds for each statement, 0 = none */
+    /* The scope the DSN named, as it named it. `database` and `schema` above follow the session
+     * wherever the application moves it; these are what a fresh session is put back on when the
+     * engine no longer holds this one. */
+    char *scope_database;
+    char *scope_schema;
+    /* Whether the engine reports newSession, which arrived together with requireSession and
+     * DELETE /api/sessions/{id}: -1 until the first answer that names a session, then 1 or 0. */
+    int tracks_sessions;
+    /* Whether an application statement left state on the session that a fresh one would not
+     * have: USE, SET, UNSET, ALTER SESSION, a temporary object, CREATE or DROP of a database or
+     * schema. */
+    int session_dirty;
+    /* Whether a transaction is open on the session: from BEGIN or START TRANSACTION until COMMIT
+     * or ROLLBACK, and from any statement until SQLEndTran while SQL_ATTR_AUTOCOMMIT is off. */
+    int in_transaction;
+    /* Whether the scope still has to go on before the next statement, because the session this
+     * connection held was lost or replaced. */
+    int scope_pending;
 } fl_dbc;
 
 typedef struct fl_bound_col {
@@ -195,13 +213,47 @@ SQLRETURN fl_diag_warn(SQLHANDLE handle, const char *sqlstate, const char *messa
 /* Execute SQL over the connection's HTTP endpoint. On transport failure returns
  * NULL and fills *transport_error (caller frees). On success returns the decoded
  * response — which may still carry error_message (SQL failure). Updates the
- * connection's session id from the response. */
+ * connection's session id from the response.
+ *
+ * A session the engine no longer holds is recovered from here: the scope goes on a fresh session
+ * and the statement is sent once more — or, when the lost session held a transaction or a
+ * context a fresh one would not have, NULL comes back with *transport_error saying so, and the
+ * statement did not run. Callers report either failure as 08S01. */
 fl_response *fl_proto_execute(fl_dbc *dbc, const char *sql, char **transport_error);
 
 /* As fl_proto_execute, declaring how many statements the request carries: -1 leaves the session's
  * MULTI_STATEMENT_COUNT to answer for it, 0 allows any number. */
 fl_response *fl_proto_execute_counted(fl_dbc *dbc, const char *sql, SQLLEN multi_statement_count,
                                       char **transport_error);
+
+/* What an execution is, for the session bookkeeping: the two calls above are both. */
+#define FL_EXEC_TRACKED 1 /* the application's statement: what it leaves on the session is noted */
+#define FL_EXEC_RECOVER 2 /* a session the engine no longer holds is taken over, or reported */
+
+/* As fl_proto_execute_counted, saying which of the above the execution is. The driver's own
+ * statements — the scope applied at connect, the ALTER SESSION that mirrors SQL_ATTR_AUTOCOMMIT —
+ * are not the application's context, and so are never noted. */
+fl_response *fl_proto_execute_as(fl_dbc *dbc, const char *sql, SQLLEN multi_statement_count,
+                                 int flags, char **transport_error);
+
+/* Releases the connection's session with DELETE /api/sessions/{id} when the engine is known to
+ * have that endpoint, and forgets it either way. Best effort: bounded by the shorter of the
+ * connection's timeouts and five seconds, and nothing it meets is reported. */
+void fl_proto_release(fl_dbc *dbc);
+
+/* Starts the session bookkeeping over, for a connection about to open: no session, no scope, and
+ * the engine's session support not yet known. */
+void fl_proto_session_reset(fl_dbc *dbc);
+
+/* ---- session (session.c) -------------------------------------------------- */
+
+/* Notes what an application statement that succeeded left on the session: whether it now holds
+ * state a fresh session would not have, and whether a transaction is open. */
+void fl_session_note(fl_dbc *dbc, const char *sql);
+
+/* Index just past the literal, quoted identifier, comment or $$ body opening at `c`, or NULL
+ * when `c` is code — the scanner parameter binding reads (execute.c). */
+const char *fl_sql_skip(const char *c);
 
 /* ---- shared helpers ------------------------------------------------------- */
 

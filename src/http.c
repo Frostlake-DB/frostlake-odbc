@@ -279,3 +279,9 @@ int fl_http_get(const char *host, int port, const char *path,
     return http_request(host, port, "GET", path, NULL, timeout_seconds,
                         status_out, body_out, error_out);
 }
+
+int fl_http_delete(const char *host, int port, const char *path,
+                   int timeout_seconds, int *status_out, char **body_out, char **error_out) {
+    return http_request(host, port, "DELETE", path, NULL, timeout_seconds,
+                        status_out, body_out, error_out);
+}

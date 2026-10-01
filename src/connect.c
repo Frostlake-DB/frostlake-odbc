@@ -150,6 +150,14 @@ static SQLRETURN do_connect(fl_dbc *dbc, const char *database, const char *schem
     }
 
     dbc->connected = 1;
+    /* A new session on this server, whatever the handle held before; and the scope it is opened
+     * on is kept as the DSN named it, for a fresh session to be put back on should the engine
+     * lose this one. */
+    fl_proto_session_reset(dbc);
+    free(dbc->scope_database);
+    dbc->scope_database = database != NULL && database[0] != '\0' ? fl_strdup(database) : NULL;
+    free(dbc->scope_schema);
+    dbc->scope_schema = schema != NULL && schema[0] != '\0' ? fl_strdup(schema) : NULL;
 
     /* Pick the working database/schema up front, mirroring the JDBC URL path
      * segment. Failure here is a real connect failure (bad database name). */
@@ -167,18 +175,22 @@ static SQLRETURN do_connect(fl_dbc *dbc, const char *database, const char *schem
             return fl_diag_set(dbc, "HY001", "Out of memory");
         }
         char *transport_error = NULL;
-        fl_response *response = fl_proto_execute(dbc, use_sql.data, &transport_error);
+        /* The scope is the driver's own, not the application's context: never noted. */
+        fl_response *response = fl_proto_execute_as(dbc, use_sql.data, -1, 0, &transport_error);
         fl_strbuf_free(&use_sql);
         if (response == NULL) {
             dbc->connected = 0;
             SQLRETURN rc = fl_diag_setf(dbc, "08001", "%s", transport_error);
             free(transport_error);
+            fl_proto_release(dbc);
             return rc;
         }
         if (response->error_message != NULL) {
             SQLRETURN rc = fl_diag_setf(dbc, "08004", "%s", response->error_message);
             fl_response_free(response);
             dbc->connected = 0;
+            /* The refusal still ran in a session, which nothing will use now. */
+            fl_proto_release(dbc);
             return rc;
         }
         fl_response_free(response);
@@ -194,7 +206,7 @@ static SQLRETURN do_connect(fl_dbc *dbc, const char *database, const char *schem
             return fl_diag_set(dbc, "HY001", "Out of memory");
         }
         char *transport_error = NULL;
-        fl_response *response = fl_proto_execute(dbc, use_sql.data, &transport_error);
+        fl_response *response = fl_proto_execute_as(dbc, use_sql.data, -1, 0, &transport_error);
         fl_strbuf_free(&use_sql);
         if (response == NULL || response->error_message != NULL) {
             SQLRETURN rc = fl_diag_setf(dbc, "08004", "%s",
@@ -202,11 +214,30 @@ static SQLRETURN do_connect(fl_dbc *dbc, const char *database, const char *schem
             free(transport_error);
             fl_response_free(response);
             dbc->connected = 0;
+            fl_proto_release(dbc);
             return rc;
         }
         fl_response_free(response);
         free(dbc->schema);
         dbc->schema = fl_strdup(schema);
+    }
+    /* SQL_ATTR_AUTOCOMMIT turned off before connecting belongs to the scope the session opens
+     * on, as it does for a fresh session that replaces a lost one: a session starts in
+     * autocommit mode, and statements meant to commit together would commit one by one. */
+    if (!dbc->autocommit) {
+        char *transport_error = NULL;
+        fl_response *response = fl_proto_execute_as(dbc, "ALTER SESSION SET AUTOCOMMIT = FALSE",
+                                                    -1, 0, &transport_error);
+        if (response == NULL || response->error_message != NULL) {
+            SQLRETURN rc = fl_diag_setf(dbc, response != NULL ? "08004" : "08001", "%s",
+                response != NULL ? response->error_message : transport_error);
+            free(transport_error);
+            fl_response_free(response);
+            dbc->connected = 0;
+            fl_proto_release(dbc);
+            return rc;
+        }
+        fl_response_free(response);
     }
     return SQL_SUCCESS;
 }
@@ -363,8 +394,10 @@ SQLRETURN SQL_API SQLDisconnect(SQLHDBC ConnectionHandle) {
         return fl_diag_set(dbc, "08003", "Connection not open");
     }
     dbc->connected = 0;
-    free(dbc->session_id);
-    dbc->session_id = NULL;
+    /* DELETE /api/sessions/{id} on an engine that has it, which also rolls back a transaction
+     * left open: best effort, bounded, and never a reason for SQLDisconnect to fail. An older
+     * engine is sent nothing, and its idle sweep reclaims the session. */
+    fl_proto_release(dbc);
     return SQL_SUCCESS;
 }
 
@@ -419,7 +452,10 @@ SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
                 char sql[64];
                 snprintf(sql, sizeof(sql), "ALTER SESSION SET AUTOCOMMIT = %s",
                          wanted ? "TRUE" : "FALSE");
-                fl_response *response = fl_proto_execute(dbc, sql, &transport_error);
+                /* The driver's own mirror of the attribute, which a fresh session gets back
+                 * with the scope: not a context the application set up, so never noted. */
+                fl_response *response = fl_proto_execute_as(dbc, sql, -1, FL_EXEC_RECOVER,
+                                                            &transport_error);
                 if (response == NULL) {
                     SQLRETURN rc = fl_diag_setf(dbc, "08S01", "%s", transport_error);
                     free(transport_error);

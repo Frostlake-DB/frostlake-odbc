@@ -148,6 +148,7 @@ static SQLRETURN alloc_dbc(fl_env *env, SQLHANDLE *out) {
      * open_timeout / read_timeout pair. */
     dbc->login_timeout = 10;
     dbc->request_timeout = 300;
+    dbc->tracks_sessions = -1;
     *out = dbc;
     return SQL_SUCCESS;
 }
@@ -224,6 +225,8 @@ static void free_dbc(fl_dbc *dbc) {
     free(dbc->session_id);
     free(dbc->database);
     free(dbc->schema);
+    free(dbc->scope_database);
+    free(dbc->scope_schema);
     free(dbc->dsn);
     free(dbc);
 }

@@ -39,4 +39,8 @@ int fl_http_post(const char *host, int port, const char *path,
 int fl_http_get(const char *host, int port, const char *path,
                 int timeout_seconds, int *status_out, char **body_out, char **error_out);
 
+/* DELETE http://host:port/path, same contract. */
+int fl_http_delete(const char *host, int port, const char *path,
+                   int timeout_seconds, int *status_out, char **body_out, char **error_out);
+
 #endif /* FL_HTTP_H */

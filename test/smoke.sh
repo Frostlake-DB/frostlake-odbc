@@ -48,3 +48,17 @@ echo "smoke test passed against localhost:$PORT (DSN + driver manager path)"
 # Same server, but calling the driver directly through dlopen.
 FROSTLAKE_TEST_PORT="$PORT" "$HERE/build/direct" "$HERE/build/libfrostlakeodbc.so"
 echo "direct test passed against localhost:$PORT (no driver manager)"
+
+# The session handling: a scripted server first, then that server relaying to this one.
+FROSTLAKE_TEST_PORT="$PORT" "$HERE/build/session" "$HERE/build/libfrostlakeodbc.so"
+echo "session test passed against a scripted server and localhost:$PORT"
+
+# The engine's testkit corpus through the driver manager, on the same server, when FL_CORPUS names
+# frostlake's engine/src/test/resources/testkit.
+if [ -n "${FL_CORPUS:-}" ]; then
+    FROSTLAKE_URL="http://localhost:$PORT" FROSTLAKE_ODBC_DRIVER="$HERE/build/libfrostlakeodbc.so" \
+        "$HERE/build/suites"
+    echo "testkit corpus passed against localhost:$PORT"
+else
+    echo "testkit corpus skipped: set FL_CORPUS to frostlake's engine/src/test/resources/testkit to replay the testkit corpus"
+fi

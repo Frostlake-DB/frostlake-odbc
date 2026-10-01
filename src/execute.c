@@ -99,6 +99,10 @@ static const char *skip_non_placeholder(const char *c) {
     return NULL;
 }
 
+const char *fl_sql_skip(const char *c) {
+    return skip_non_placeholder(c);
+}
+
 /* Whether the application has bound any parameter on this statement. Substitution waits for
  * one: with nothing bound, every `?` is the engine's to read — a Snowflake Scripting cursor bind
  * such as `DECLARE c CURSOR FOR ... WHERE x > ?` opened `USING (...)` is exactly that — and the
