@@ -35,6 +35,7 @@
 #include <dlfcn.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -396,7 +397,7 @@ static const char *sql_of(int index) {
         for (const char *c = field + 7; *c != '\0' && *c != '"' && n + 1 < sizeof(text); c++) {
             if (*c == '\\' && c[1] != '\0') {
                 c++;
-                text[n++] = *c == 'n' ? '\n' : *c;
+                text[n++] = *c == 'n' ? '\n' : *c == 'r' ? '\r' : *c;
             } else {
                 text[n++] = *c;
             }
@@ -446,6 +447,8 @@ static struct {
     SQLRETURN (*Connect)(SQLHDBC, SQLHWND, SQLCHAR *, SQLSMALLINT, SQLCHAR *, SQLSMALLINT,
                          SQLSMALLINT *, SQLUSMALLINT);
     SQLRETURN (*Exec)(SQLHSTMT, SQLCHAR *, SQLINTEGER);
+    SQLRETURN (*BindParameter)(SQLHSTMT, SQLUSMALLINT, SQLSMALLINT, SQLSMALLINT, SQLSMALLINT,
+                               SQLULEN, SQLSMALLINT, SQLPOINTER, SQLLEN, SQLLEN *);
     SQLRETURN (*Fetch)(SQLHSTMT);
     SQLRETURN (*GetData)(SQLHSTMT, SQLUSMALLINT, SQLSMALLINT, SQLPOINTER, SQLLEN, SQLLEN *);
     SQLRETURN (*Diag)(SQLSMALLINT, SQLHANDLE, SQLSMALLINT, SQLCHAR *, SQLINTEGER *, SQLCHAR *,
@@ -740,7 +743,8 @@ static void a_lost_context_is_reported_not_replaced(void) {
     static const char *const movers[] = {
         "USE SCHEMA other", "SET v = 1", "UNSET v", "ALTER SESSION SET TIMEZONE = 'UTC'",
         "CREATE TEMPORARY TABLE tmp (i INT)", "CREATE DATABASE other",
-        "SELECT 1; USE SCHEMA other", NULL
+        "SELECT 1; USE SCHEMA other", "SELECT 1 AS a$$b; USE SCHEMA other",
+        "SELECT 1 -- note\r; USE SCHEMA other", "-- note\rUSE SCHEMA other", NULL
     };
     int reported = 0;
     int resent = 0;
@@ -765,7 +769,8 @@ static void a_lost_context_is_reported_not_replaced(void) {
         stop_server();
     }
     check(reported == total,
-          "USE, SET, UNSET, ALTER SESSION, a temporary object or CREATE DATABASE went with the session: 08S01");
+          "USE, SET, UNSET, ALTER SESSION, a temporary object or CREATE DATABASE went with the session: 08S01,"
+          " also after a name holding $$ or a comment a carriage return ends");
     check(resent == 0, "and the statement is not sent again");
 }
 
@@ -870,6 +875,95 @@ static void a_refused_scope_releases_the_session(void) {
     check(delete_count() == 1 && strcmp(delete_path(0), "/api/sessions/s9") == 0,
           "and the session the refusal ran in is released");
     odbc.Free(SQL_HANDLE_DBC, dbc);
+    stop_server();
+}
+
+/* ---- parameters --------------------------------------------------------------- */
+
+/* Runs one statement with one parameter bound; answers the SQL the server was sent for it. */
+static const char *sent_with(SQLHDBC dbc, const char *sql, SQLSMALLINT c_type, SQLSMALLINT sql_type,
+                             SQLPOINTER value) {
+    SQLHSTMT stmt = NULL;
+    SQLLEN indicator = SQL_NTS;
+    odbc.Alloc(SQL_HANDLE_STMT, dbc, &stmt);
+    odbc.BindParameter(stmt, 1, SQL_PARAM_INPUT, c_type, sql_type, 38, 0, value, 0, &indicator);
+    odbc.Exec(stmt, (SQLCHAR *) sql, SQL_NTS);
+    odbc.Free(SQL_HANDLE_STMT, stmt);
+    int executes[SEEN_LIMIT];
+    int count = requests_of("POST", executes);
+    return count > 0 ? sql_of(executes[count - 1]) : "";
+}
+
+static void a_negative_number_binds_in_parentheses(void) {
+    start_server(0);
+    scope_answered();
+    for (int i = 0; i < 12; i++) {
+        answer("s1", 0, NULL);
+    }
+    released();
+    SQLHDBC dbc = open_scoped();
+    SQLBIGINT bigint = -5;
+    check(strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_SBIGINT, SQL_BIGINT, &bigint), "SELECT 3-(-5)") == 0,
+          "a negative number after a minus is sent as 3-(-5), not as the comment 3--5");
+    SQLINTEGER integer = -5;
+    check(strcmp(sent_with(dbc, "SELECT ?::VARCHAR", SQL_C_SLONG, SQL_INTEGER, &integer),
+                 "SELECT (-5)::VARCHAR") == 0,
+          "and is negated before it is cast: (-5)::VARCHAR");
+    bigint = INT64_MIN;
+    SQLSMALLINT smallint = -5;
+    SQLSCHAR tinyint = -5;
+    check(strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_SBIGINT, SQL_BIGINT, &bigint),
+                 "SELECT 3-(-9223372036854775808)") == 0
+              && strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_SSHORT, SQL_SMALLINT, &smallint),
+                        "SELECT 3-(-5)") == 0
+              && strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_STINYINT, SQL_TINYINT, &tinyint),
+                        "SELECT 3-(-5)") == 0,
+          "so is every signed integer type");
+    SQLDOUBLE dbl = -2.5;
+    SQLREAL real = -2.5f;
+    check(strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_DOUBLE, SQL_DOUBLE, &dbl), "SELECT 3-(-2.5)") == 0
+              && strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_FLOAT, SQL_REAL, &real), "SELECT 3-(-2.5)") == 0,
+          "and a negative double or float");
+    dbl = -0.0;
+    check(strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_DOUBLE, SQL_DOUBLE, &dbl), "SELECT 3-(-0)") == 0,
+          "the text decides, not the value: -0.0 is not below zero but is written with a minus");
+    char decimal[] = "-2.5";
+    char huge[] = "-12345678901234567890123456789012345678";
+    char padded[] = " -5";
+    check(strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_CHAR, SQL_DECIMAL, decimal), "SELECT 3-(-2.5)") == 0
+              && strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_CHAR, SQL_NUMERIC, huge),
+                        "SELECT 3-(-12345678901234567890123456789012345678)") == 0
+              && strcmp(sent_with(dbc, "SELECT ?::VARCHAR", SQL_C_CHAR, SQL_INTEGER, padded),
+                        "SELECT ( -5)::VARCHAR") == 0,
+          "and a negative number bound as text of a numeric type, padded or not");
+    integer = 5;
+    check(strcmp(sent_with(dbc, "SELECT 3-?", SQL_C_SLONG, SQL_INTEGER, &integer), "SELECT 3-5") == 0,
+          "a positive number is sent as it is");
+    close_connection(dbc);
+    stop_server();
+}
+
+static void a_placeholder_is_found_where_the_lexer_finds_one(void) {
+    start_server(0);
+    scope_answered();
+    for (int i = 0; i < 4; i++) {
+        answer("s1", 0, NULL);
+    }
+    released();
+    SQLHDBC dbc = open_scoped();
+    SQLINTEGER seven = 7;
+    check(strcmp(sent_with(dbc, "SELECT 1 AS a$$b, ?", SQL_C_SLONG, SQL_INTEGER, &seven),
+                 "SELECT 1 AS a$$b, 7") == 0,
+          "a name is read whole: the $$ inside a$$b opens no body");
+    check(strcmp(sent_with(dbc, "SELECT 1 -- c\r, ?", SQL_C_SLONG, SQL_INTEGER, &seven),
+                 "SELECT 1 -- c\r, 7") == 0
+              && strcmp(sent_with(dbc, "SELECT 1 // c\r, ?", SQL_C_SLONG, SQL_INTEGER, &seven),
+                        "SELECT 1 // c\r, 7") == 0,
+          "a line comment ends at a carriage return as well as at a line feed");
+    check(strcmp(sent_with(dbc, "SELECT $$a?b$$, ?", SQL_C_SLONG, SQL_INTEGER, &seven),
+                 "SELECT $$a?b$$, 7") == 0,
+          "and a ? inside a $$ body is still no placeholder");
+    close_connection(dbc);
     stop_server();
 }
 
@@ -987,6 +1081,7 @@ int main(int argc, char **argv) {
     *(void **) &odbc.EnvAttr = dlsym(lib, "SQLSetEnvAttr");
     *(void **) &odbc.Connect = dlsym(lib, "SQLDriverConnect");
     *(void **) &odbc.Exec = dlsym(lib, "SQLExecDirect");
+    *(void **) &odbc.BindParameter = dlsym(lib, "SQLBindParameter");
     *(void **) &odbc.Fetch = dlsym(lib, "SQLFetch");
     *(void **) &odbc.GetData = dlsym(lib, "SQLGetData");
     *(void **) &odbc.Diag = dlsym(lib, "SQLGetDiagRec");
@@ -995,7 +1090,8 @@ int main(int argc, char **argv) {
     *(void **) &odbc.EndTran = dlsym(lib, "SQLEndTran");
     *(void **) &odbc.Disconnect = dlsym(lib, "SQLDisconnect");
     *(void **) &odbc.Free = dlsym(lib, "SQLFreeHandle");
-    if (!odbc.Alloc || !odbc.EnvAttr || !odbc.Connect || !odbc.Exec || !odbc.Fetch
+    if (!odbc.Alloc || !odbc.EnvAttr || !odbc.Connect || !odbc.Exec || !odbc.BindParameter
+        || !odbc.Fetch
         || !odbc.GetData || !odbc.Diag || !odbc.SetConnect || !odbc.GetConnect || !odbc.EndTran
         || !odbc.Disconnect || !odbc.Free) {
         fprintf(stderr, "the driver does not export the ODBC entry points\n");
@@ -1019,6 +1115,8 @@ int main(int argc, char **argv) {
     disconnect_releases_the_session_once();
     disconnect_never_fails_on_the_release();
     a_refused_scope_releases_the_session();
+    a_negative_number_binds_in_parentheses();
+    a_placeholder_is_found_where_the_lexer_finds_one();
 
     const char *port = getenv("FROSTLAKE_TEST_PORT");
     if (port != NULL && port[0] != '\0') {

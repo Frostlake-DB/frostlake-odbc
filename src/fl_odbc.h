@@ -33,7 +33,7 @@
 #include <stddef.h>
 
 #define FL_DRIVER_NAME "Frostlake ODBC Driver"
-#define FL_DRIVER_VER "01.02.0000"
+#define FL_DRIVER_VER "01.02.0001"
 #define FL_ODBC_VER "03.51"
 #define FL_DBMS_NAME "Frostlake"
 
@@ -251,8 +251,8 @@ void fl_proto_session_reset(fl_dbc *dbc);
  * state a fresh session would not have, and whether a transaction is open. */
 void fl_session_note(fl_dbc *dbc, const char *sql);
 
-/* Index just past the literal, quoted identifier, comment or $$ body opening at `c`, or NULL
- * when `c` is code — the scanner parameter binding reads (execute.c). */
+/* Index just past the literal, quoted identifier, comment, $$ body or name opening at `c`, or
+ * NULL when `c` is other code — the scanner parameter binding reads (execute.c). */
 const char *fl_sql_skip(const char *c);
 
 /* ---- shared helpers ------------------------------------------------------- */

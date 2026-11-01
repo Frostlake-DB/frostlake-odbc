@@ -52,8 +52,19 @@ static char *copy_sql(SQLCHAR *text, SQLINTEGER length) {
  * identifiers, -- // and slash-star comments, and $$-delimited bodies, which is
  * how UDF and procedure sources are written — a `?` inside a JavaScript body is
  * the conditional operator, not a bind marker. An unterminated construct
- * swallows the rest of the statement, which is what the siblings do too. */
+ * swallows the rest of the statement, which is what the siblings do too. A name
+ * is stepped over whole, as the lexer reads one, so the $$ inside a$$b opens no
+ * body. */
 static const char *skip_non_placeholder(const char *c) {
+    if ((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') || *c == '_') {
+        /* [a-zA-Z_][a-zA-Z0-9_$]*, the lexer's IDENTIFIER */
+        const char *p = c + 1;
+        while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9')
+               || *p == '_' || *p == '$') {
+            p++;
+        }
+        return p;
+    }
     if (*c == '\'') {
         const char *p = c + 1;
         while (*p != '\0') {
@@ -85,8 +96,10 @@ static const char *skip_non_placeholder(const char *c) {
         return p;
     }
     if ((c[0] == '-' && c[1] == '-') || (c[0] == '/' && c[1] == '/')) {
-        const char *p = strchr(c + 2, '\n');
-        return p != NULL ? p + 1 : c + strlen(c);
+        /* ends at a line feed or a carriage return, whichever comes first, as the lexer's
+         * LINE_COMMENT does: ('--' | '//') ~[\r\n]* */
+        const char *p = c + 2 + strcspn(c + 2, "\r\n");
+        return *p != '\0' ? p + 1 : p;
     }
     if (c[0] == '/' && c[1] == '*') {
         const char *p = strstr(c + 2, "*/");
@@ -185,6 +198,24 @@ static int is_numeric_literal(const char *text, size_t length) {
     return i == end;
 }
 
+/* Append a number's text, in parentheses when it is negative: spliced bare after a minus, `3-?`
+ * bound -5 became `3--5`, a comment, and `?::VARCHAR` cast before it negated. The text decides,
+ * not the value, so the "-0" printf writes for -0.0 goes in parentheses too; the blanks of a
+ * padded buffer stay inside them. */
+static int append_number(fl_strbuf *buf, const char *text, size_t length) {
+    size_t i = 0;
+    while (i < length && (text[i] == ' ' || text[i] == '\t')) {
+        i++;
+    }
+    if (i == length || text[i] != '-') {
+        return fl_strbuf_append_len(buf, text, length);
+    }
+    if (fl_strbuf_append(buf, "(") != 0 || fl_strbuf_append_len(buf, text, length) != 0) {
+        return -1;
+    }
+    return fl_strbuf_append(buf, ")");
+}
+
 /* Append a string parameter as a quoted literal, escaping backslash + quote. */
 static int append_string_literal(fl_strbuf *buf, const char *text, size_t length) {
     if (fl_strbuf_append(buf, "'") != 0) {
@@ -276,7 +307,7 @@ static int append_param_literal(fl_stmt *stmt, fl_strbuf *buf, const fl_bound_pa
                         "Parameter bound as a numeric SQL type is not a number");
                     return -1;
                 }
-                return fl_strbuf_append_len(buf, (const char *) param->buffer, length);
+                return append_number(buf, (const char *) param->buffer, length);
             }
             return append_string_literal(buf, (const char *) param->buffer, length);
         }
@@ -286,36 +317,36 @@ static int append_param_literal(fl_stmt *stmt, fl_strbuf *buf, const fl_bound_pa
         case SQL_C_SLONG:
         case SQL_C_LONG:
             snprintf(text, sizeof(text), "%ld", (long) *(SQLINTEGER *) param->buffer);
-            return fl_strbuf_append(buf, text);
+            return append_number(buf, text, strlen(text));
         case SQL_C_ULONG:
             snprintf(text, sizeof(text), "%lu", (unsigned long) *(SQLUINTEGER *) param->buffer);
             return fl_strbuf_append(buf, text);
         case SQL_C_SSHORT:
         case SQL_C_SHORT:
             snprintf(text, sizeof(text), "%d", (int) *(SQLSMALLINT *) param->buffer);
-            return fl_strbuf_append(buf, text);
+            return append_number(buf, text, strlen(text));
         case SQL_C_USHORT:
             snprintf(text, sizeof(text), "%u", (unsigned) *(SQLUSMALLINT *) param->buffer);
             return fl_strbuf_append(buf, text);
         case SQL_C_STINYINT:
         case SQL_C_TINYINT:
             snprintf(text, sizeof(text), "%d", (int) *(SQLSCHAR *) param->buffer);
-            return fl_strbuf_append(buf, text);
+            return append_number(buf, text, strlen(text));
         case SQL_C_UTINYINT:
             snprintf(text, sizeof(text), "%u", (unsigned) *(SQLCHAR *) param->buffer);
             return fl_strbuf_append(buf, text);
         case SQL_C_SBIGINT:
             snprintf(text, sizeof(text), "%lld", (long long) *(SQLBIGINT *) param->buffer);
-            return fl_strbuf_append(buf, text);
+            return append_number(buf, text, strlen(text));
         case SQL_C_UBIGINT:
             snprintf(text, sizeof(text), "%llu", (unsigned long long) *(SQLUBIGINT *) param->buffer);
             return fl_strbuf_append(buf, text);
         case SQL_C_FLOAT:
             snprintf(text, sizeof(text), "%.9g", (double) *(SQLREAL *) param->buffer);
-            return fl_strbuf_append(buf, text);
+            return append_number(buf, text, strlen(text));
         case SQL_C_DOUBLE:
             snprintf(text, sizeof(text), "%.17g", *(SQLDOUBLE *) param->buffer);
-            return fl_strbuf_append(buf, text);
+            return append_number(buf, text, strlen(text));
         case SQL_C_BIT:
             return fl_strbuf_append(buf, *(SQLCHAR *) param->buffer ? "TRUE" : "FALSE");
         case SQL_C_BINARY: {
